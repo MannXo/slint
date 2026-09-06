@@ -41,7 +41,7 @@ pub mod opengl;
 #[cfg(feature = "wgpu-30")]
 pub mod wgpu;
 #[cfg(feature = "wgpu-30")]
-pub use wgpu::FemtoVGWGPURenderer;
+pub use wgpu::{FemtoVGWGPURenderer, FemtoVGWGPURendererExt};
 
 pub trait WindowSurface<R: femtovg::Renderer> {
     fn render_output(&self) -> impl Into<R::RenderOutput>;

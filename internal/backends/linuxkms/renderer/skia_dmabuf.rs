@@ -39,7 +39,7 @@ impl SkiaDmabufRendererAdapter {
         let size = PhysicalWindowSize::new(width, height);
 
         let display = GbmDmabufDisplay::new(drm_output, &device)?;
-        let barriers = ScanoutBarriers::new(&device, BUFFER_COUNT)?;
+        let barriers = ScanoutBarriers::new(&device, &queue, BUFFER_COUNT, false)?;
 
         let renderer = SkiaWGPU30Renderer::new(instance, adapter, device.clone(), queue)?;
 

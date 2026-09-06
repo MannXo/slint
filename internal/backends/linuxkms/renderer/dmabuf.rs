@@ -108,7 +108,9 @@ pub fn init_wgpu(
     }
 
     // The features and limits an application asked for, or everything the adapter
-    // offers when it asked for nothing.
+    // offers when it asked for nothing. i-slint-core reads them from the WGPU
+    // configuration, whose type only exists with its `unstable-wgpu-30`, which
+    // `renderer-femtovg-wgpu` doesn't enable.
     let mut descriptor = i_slint_core::graphics::wgpu_30::surfaceless_device_descriptor(
         requested_graphics_api,
         &adapter,
@@ -138,7 +140,7 @@ pub fn init_wgpu(
 /// `VK_QUEUE_FAMILY_EXTERNAL` instead.
 /// Also returns `None` for a descriptor the adapter can't meet,
 /// since opening the device this way skips the checks `request_device` reports those with.
-fn open_device_with_queue_family_foreign(
+pub(crate) fn open_device_with_queue_family_foreign(
     adapter: &wgpu::Adapter,
     descriptor: &wgpu::DeviceDescriptor<'_>,
 ) -> Option<Result<(wgpu::Device, wgpu::Queue), wgpu::RequestDeviceError>> {

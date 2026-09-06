@@ -15,8 +15,11 @@
 //! so no ownership acquire has to match the release.
 //! [`ScanoutBarriers::release`] moves the image to `GENERAL` for the display.
 //!
-//! Skia draws through its own Vulkan access. Before it does, wgpu records the image as a
-//! color target, the layout the acquire leaves it in, so wgpu's view stays true.
+//! Where wgpu draws into the image, as with FemtoVG, wgpu's view has to stay true at
+//! every point wgpu touches it. wgpu leaves a color target in `COLOR_ATTACHMENT_OPTIMAL`
+//! and only transitions on the next use, so the release pins that state through wgpu
+//! first. Skia draws through its own Vulkan access. Before it does, wgpu records the
+//! image as a color target, the layout the acquire leaves it in.
 
 // cSpell: ignore dmabuf subresource
 
@@ -42,8 +45,11 @@ struct Slot {
 
 pub struct ScanoutBarriers {
     device: wgpu::Device,
+    queue: wgpu::Queue,
     command_pool: vk::CommandPool,
     slots: Vec<Slot>,
+    /// Whether wgpu draws into the images, see the module doc.
+    drawn_by_wgpu: bool,
     queue_family_index: u32,
     /// Who the image is released to, see
     /// [`scanout_queue_family_index`](crate::renderer::dmabuf::scanout_queue_family_index).
@@ -52,7 +58,12 @@ pub struct ScanoutBarriers {
 
 impl ScanoutBarriers {
     /// Barriers for `buffer_count` scanout buffers, addressed by their index.
-    pub fn new(device: &wgpu::Device, buffer_count: usize) -> Result<Self, PlatformError> {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer_count: usize,
+        drawn_by_wgpu: bool,
+    ) -> Result<Self, PlatformError> {
         // Safety: the raw device only creates the pool and the buffers here; the pool is
         // destroyed in `Drop`, while `device` is still alive.
         unsafe {
@@ -72,8 +83,10 @@ impl ScanoutBarriers {
                 .map_err(|e| format!("Error creating a command pool for scanout barriers: {e}"))?;
             let mut barriers = Self {
                 device: device.clone(),
+                queue: queue.clone(),
                 command_pool,
                 slots: Vec::with_capacity(buffer_count),
+                drawn_by_wgpu,
                 queue_family_index,
                 scanout_queue_family_index,
             };
@@ -124,6 +137,21 @@ impl ScanoutBarriers {
     /// Wait for the queue to go idle before scanning the buffer out, and before the next
     /// [`Self::acquire`] of any buffer, which re-records the command buffers.
     pub fn release(&self, index: usize, texture: &wgpu::Texture) -> Result<(), PlatformError> {
+        if self.drawn_by_wgpu {
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Slint scanout release"),
+            });
+            encoder.transition_resources(
+                std::iter::empty(),
+                std::iter::once(wgpu::TextureTransition {
+                    texture,
+                    selector: None,
+                    state: wgpu::TextureUses::COLOR_TARGET,
+                }),
+            );
+            self.queue.submit(Some(encoder.finish()));
+        }
+
         let slot = &self.slots[index];
         let barrier = vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
@@ -212,8 +240,8 @@ impl Drop for ScanoutBarriers {
 mod tests {
     //! Drive the barriers against whatever Vulkan device the machine offers, with the
     //! validation layers loaded where they are installed, and fail on any validation
-    //! error: no command buffer is re-recorded while pending, and every barrier names the
-    //! layout the image is in.
+    //! error: at every point wgpu touches the image, the image is in the layout wgpu
+    //! believes, and no command buffer is re-recorded while pending.
     //!
     //! Ordinary textures stand in for the dma-buf imports; the barriers don't care where
     //! the image's memory came from. Without a Vulkan device the tests pass vacuously
@@ -242,6 +270,46 @@ mod tests {
         assert!(errors.is_empty(), "validation errors after round {round}:\n{}", errors.join("\n"));
     }
 
+    #[test]
+    fn frames_drawn_by_wgpu_leave_wgpu_and_the_display_in_agreement() {
+        let Some((device, queue)) = validation::device() else { return };
+
+        let barriers = ScanoutBarriers::new(&device, &queue, 2, true).expect("barriers");
+        eprintln!("Releasing to queue family {:#x}", barriers.scanout_queue_family_index);
+        let textures = stand_in_scanout_buffers(&device);
+
+        // Two rounds through both buffers: the first finds each image UNDEFINED, the
+        // second finds it GENERAL and released, which is the case the acquire exists for.
+        for round in 0..4 {
+            let (index, texture) = (round % 2, &textures[round % 2]);
+            barriers.acquire(index, texture).expect("acquire");
+
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut encoder = device.create_command_encoder(&Default::default());
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("frame"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLUE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            queue.submit(Some(encoder.finish()));
+
+            barriers.release(index, texture).expect("release");
+            wait_for_gpu(&device).expect("wait");
+            assert_no_validation_errors(round);
+        }
+    }
+
     /// The way Skia uses the barriers: wgpu only records each image as a color target
     /// before the frame, as `render_to_texture` does, and every frame waits for the GPU
     /// after its release.
@@ -249,8 +317,7 @@ mod tests {
     fn frames_drawn_past_wgpu_hand_over_cleanly() {
         let Some((device, queue)) = validation::device() else { return };
 
-        let barriers = ScanoutBarriers::new(&device, 2).expect("barriers");
-        eprintln!("Releasing to queue family {:#x}", barriers.scanout_queue_family_index);
+        let barriers = ScanoutBarriers::new(&device, &queue, 2, false).expect("barriers");
         let textures = stand_in_scanout_buffers(&device);
 
         for round in 0..6 {
