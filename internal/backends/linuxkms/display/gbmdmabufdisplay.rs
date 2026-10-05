@@ -40,6 +40,30 @@ struct Buffer {
     _bo: gbm::BufferObject<()>,
 }
 
+/// A gbm buffer as a framebuffer without a modifier, for a display that takes none.
+struct ImplicitLayout<'a>(&'a gbm::BufferObject<()>);
+
+impl drm::buffer::PlanarBuffer for ImplicitLayout<'_> {
+    fn size(&self) -> (u32, u32) {
+        drm::buffer::PlanarBuffer::size(self.0)
+    }
+    fn format(&self) -> drm::buffer::DrmFourcc {
+        drm::buffer::PlanarBuffer::format(self.0)
+    }
+    fn modifier(&self) -> Option<drm::buffer::DrmModifier> {
+        None
+    }
+    fn pitches(&self) -> [u32; 4] {
+        drm::buffer::PlanarBuffer::pitches(self.0)
+    }
+    fn handles(&self) -> [Option<drm::buffer::Handle>; 4] {
+        drm::buffer::PlanarBuffer::handles(self.0)
+    }
+    fn offsets(&self) -> [u32; 4] {
+        drm::buffer::PlanarBuffer::offsets(self.0)
+    }
+}
+
 pub struct GbmDmabufDisplay {
     pub drm_output: DrmOutput,
     buffers: [Buffer; BUFFER_COUNT],
@@ -54,7 +78,24 @@ impl GbmDmabufDisplay {
 
         let (width, height) = drm_output.size();
 
-        let importable_modifiers = importable_modifiers(device, width, height)?;
+        let mut importable_modifiers = importable_modifiers(device, width, height)?;
+
+        // A KMS driver without DRM_CAP_ADDFB2_MODIFIERS, such as i.MX8M Plus's LCDIF,
+        // rejects a framebuffer that names a modifier and scans out linear buffers only.
+        let display_takes_modifiers = drm::Device::get_driver_capability(
+            &drm_output.drm_device,
+            drm::DriverCapability::AddFB2Modifiers,
+        )
+        .is_ok_and(|value| value != 0);
+        if !display_takes_modifiers {
+            if !importable_modifiers.contains(&gbm::Modifier::Linear) {
+                return Err(PlatformError::Other(format!(
+                    "The display only scans out linear buffers, but Vulkan can import the scanout \
+                     format only with {importable_modifiers:?}"
+                )));
+            }
+            importable_modifiers = vec![gbm::Modifier::Linear];
+        }
 
         let mut buffers = Vec::with_capacity(BUFFER_COUNT);
         let mut linear_fallback = None;
@@ -64,6 +105,7 @@ impl GbmDmabufDisplay {
                 &drm_output,
                 device,
                 &importable_modifiers,
+                display_takes_modifiers,
                 width,
                 height,
             )?;
@@ -85,6 +127,7 @@ impl GbmDmabufDisplay {
         drm_output: &DrmOutput,
         device: &wgpu::Device,
         importable_modifiers: &[gbm::Modifier],
+        display_takes_modifiers: bool,
         width: u32,
         height: u32,
     ) -> Result<(Buffer, Option<String>), PlatformError> {
@@ -143,22 +186,21 @@ impl GbmDmabufDisplay {
         let modifier =
             if reported == gbm::Modifier::Invalid { gbm::Modifier::Linear } else { reported };
 
-        // Only claim a modifier to KMS when gbm named one. A buffer whose layout
-        // is implicit has none to pass, even where `LINEAR` made it linear for the
-        // Vulkan import above. Same rule as `GbmDisplay::present`.
-        let flags = if reported == gbm::Modifier::Invalid {
-            drm::control::FbCmd2Flags::empty()
-        } else {
-            drm::control::FbCmd2Flags::MODIFIERS
-        };
-
-        let framebuffer = OwnedFramebufferHandle {
-            handle: drm_output
+        // Only claim a modifier to KMS when gbm named one and the display takes
+        // modifiers. A buffer whose layout is implicit has none to pass, even where
+        // `LINEAR` made it linear for the Vulkan import above.
+        // Same rule as `GbmDisplay::present`.
+        let handle = if !display_takes_modifiers {
+            drm_output
                 .drm_device
-                .add_planar_framebuffer(&bo, flags)
-                .map_err(|e| format!("Error adding gbm buffer as framebuffer: {e}"))?,
-            device: drm_output.drm_device.clone(),
-        };
+                .add_planar_framebuffer(&ImplicitLayout(&bo), drm::control::FbCmd2Flags::empty())
+        } else if reported == gbm::Modifier::Invalid {
+            drm_output.drm_device.add_planar_framebuffer(&bo, drm::control::FbCmd2Flags::empty())
+        } else {
+            drm_output.drm_device.add_planar_framebuffer(&bo, drm::control::FbCmd2Flags::MODIFIERS)
+        }
+        .map_err(|e| format!("Error adding gbm buffer as framebuffer: {e}"))?;
+        let framebuffer = OwnedFramebufferHandle { handle, device: drm_output.drm_device.clone() };
 
         let texture = import_dmabuf_texture(device, &bo, modifier)?;
 
