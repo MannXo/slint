@@ -9,6 +9,9 @@
 // parameters or vertex inputs, such as `vec4<f32>(position, 1.0)`. So there are no helper
 // functions, the vertex inputs are separate parameters, and the vertex shaders multiply
 // the matrices column by column.
+//
+// Every draw is instanced: `i0` to `i3` are the columns of an instance's transform, and
+// `tint` multiplies its color and opacity, see `Instance` in `renderer.rs`.
 
 struct Spot {
     // xyz: position; w: the distance where the light ends.
@@ -58,6 +61,7 @@ struct LowVarying {
     // The vertex color, times the light for lit surfaces.
     @location(1) color: vec3<f32>,
     @location(2) fog_depth: f32,
+    @location(3) alpha: f32,
 }
 
 @vertex
@@ -66,14 +70,21 @@ fn vs_unlit_low(
     @location(1) n: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) color: vec3<f32>,
+    @location(4) i0: vec4<f32>,
+    @location(5) i1: vec4<f32>,
+    @location(6) i2: vec4<f32>,
+    @location(7) i3: vec4<f32>,
+    @location(8) tint: vec4<f32>,
 ) -> LowVarying {
+    let q = i0.xyz * p.x + i1.xyz * p.y + i2.xyz * p.z + i3.xyz;
     let m = object.model_view;
-    let view = m[0].xyz * p.x + m[1].xyz * p.y + m[2].xyz * p.z + m[3].xyz;
+    let view = m[0].xyz * q.x + m[1].xyz * q.y + m[2].xyz * q.z + m[3].xyz;
     let projection = globals.projection;
     var out: LowVarying;
     out.clip = vec4<f32>(view.xy * projection.xy, view.z * projection.z + projection.w, -view.z);
     out.uv = uv * object.uv_transform.xy + object.uv_transform.zw;
-    out.color = color;
+    out.color = color * tint.rgb;
+    out.alpha = tint.a;
     out.fog_depth = -view.z;
     return out;
 }
@@ -84,18 +95,26 @@ fn vs_lit_low(
     @location(1) n: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) color: vec3<f32>,
+    @location(4) i0: vec4<f32>,
+    @location(5) i1: vec4<f32>,
+    @location(6) i2: vec4<f32>,
+    @location(7) i3: vec4<f32>,
+    @location(8) tint: vec4<f32>,
 ) -> LowVarying {
+    let q = i0.xyz * p.x + i1.xyz * p.y + i2.xyz * p.z + i3.xyz;
     let m = object.model_view;
-    let view = m[0].xyz * p.x + m[1].xyz * p.y + m[2].xyz * p.z + m[3].xyz;
+    let view = m[0].xyz * q.x + m[1].xyz * q.y + m[2].xyz * q.z + m[3].xyz;
     let projection = globals.projection;
     let model = object.model;
-    let normal = normalize(model[0].xyz * n.x + model[1].xyz * n.y + model[2].xyz * n.z);
+    let r = i0.xyz * n.x + i1.xyz * n.y + i2.xyz * n.z;
+    let normal = normalize(model[0].xyz * r.x + model[1].xyz * r.y + model[2].xyz * r.z);
     let hemisphere = mix(globals.ground.rgb, globals.sky.rgb, normal.y * 0.5 + 0.5);
     let sun = globals.sun_color.rgb * max(dot(normal, globals.sun_direction.xyz), 0.0);
     var out: LowVarying;
     out.clip = vec4<f32>(view.xy * projection.xy, view.z * projection.z + projection.w, -view.z);
     out.uv = uv * object.uv_transform.xy + object.uv_transform.zw;
-    out.color = color * (hemisphere + sun);
+    out.color = color * tint.rgb * (hemisphere + sun);
+    out.alpha = tint.a;
     out.fog_depth = -view.z;
     return out;
 }
@@ -105,7 +124,7 @@ fn fs_low(in: LowVarying) -> @location(0) vec4<f32> {
     let texel = textureSample(color_texture, color_sampler, in.uv);
     let color = object.color.rgb * texel.rgb * in.color;
     let fog = smoothstep(globals.fog_range.x, globals.fog_range.y, in.fog_depth) * object.params.z;
-    return vec4<f32>(mix(color, globals.fog_color.rgb, fog), object.color.a * texel.a);
+    return vec4<f32>(mix(color, globals.fog_color.rgb, fog), object.color.a * texel.a * in.alpha);
 }
 
 // Low quality for lit surfaces with a light map, such as the floor with its pools of light.
@@ -118,6 +137,7 @@ struct LightVarying {
     @location(1) color: vec3<f32>,
     @location(2) fog_depth: f32,
     @location(3) light_uv: vec2<f32>,
+    @location(4) alpha: f32,
 }
 
 @vertex
@@ -126,18 +146,26 @@ fn vs_lit_low_light(
     @location(1) n: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) color: vec3<f32>,
+    @location(4) i0: vec4<f32>,
+    @location(5) i1: vec4<f32>,
+    @location(6) i2: vec4<f32>,
+    @location(7) i3: vec4<f32>,
+    @location(8) tint: vec4<f32>,
 ) -> LightVarying {
+    let q = i0.xyz * p.x + i1.xyz * p.y + i2.xyz * p.z + i3.xyz;
     let m = object.model_view;
-    let view = m[0].xyz * p.x + m[1].xyz * p.y + m[2].xyz * p.z + m[3].xyz;
+    let view = m[0].xyz * q.x + m[1].xyz * q.y + m[2].xyz * q.z + m[3].xyz;
     let projection = globals.projection;
     let model = object.model;
-    let normal = normalize(model[0].xyz * n.x + model[1].xyz * n.y + model[2].xyz * n.z);
+    let r = i0.xyz * n.x + i1.xyz * n.y + i2.xyz * n.z;
+    let normal = normalize(model[0].xyz * r.x + model[1].xyz * r.y + model[2].xyz * r.z);
     let hemisphere = mix(globals.ground.rgb, globals.sky.rgb, normal.y * 0.5 + 0.5);
     let sun = globals.sun_color.rgb * max(dot(normal, globals.sun_direction.xyz), 0.0);
     var out: LightVarying;
     out.clip = vec4<f32>(view.xy * projection.xy, view.z * projection.z + projection.w, -view.z);
     out.uv = uv * object.uv_transform.xy + object.uv_transform.zw;
-    out.color = color * (hemisphere + sun);
+    out.color = color * tint.rgb * (hemisphere + sun);
+    out.alpha = tint.a;
     out.fog_depth = -view.z;
     out.light_uv = uv;
     return out;
@@ -149,7 +177,7 @@ fn fs_low_light(in: LightVarying) -> @location(0) vec4<f32> {
     let color = object.color.rgb * texel.rgb * in.color;
     let fog = smoothstep(globals.fog_range.x, globals.fog_range.y, in.fog_depth) * object.params.z;
     let light = textureSample(light_texture, light_sampler, in.light_uv).rgb;
-    return vec4<f32>(mix(color, globals.fog_color.rgb, fog) + light, object.color.a * texel.a);
+    return vec4<f32>(mix(color, globals.fog_color.rgb, fog) + light, object.color.a * texel.a * in.alpha);
 }
 
 struct HighVarying {
@@ -159,6 +187,7 @@ struct HighVarying {
     @location(2) world: vec3<f32>,
     @location(3) normal: vec3<f32>,
     @location(4) fog_depth: f32,
+    @location(5) alpha: f32,
 }
 
 @vertex
@@ -167,18 +196,26 @@ fn vs_high(
     @location(1) n: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) color: vec3<f32>,
+    @location(4) i0: vec4<f32>,
+    @location(5) i1: vec4<f32>,
+    @location(6) i2: vec4<f32>,
+    @location(7) i3: vec4<f32>,
+    @location(8) tint: vec4<f32>,
 ) -> HighVarying {
+    let q = i0.xyz * p.x + i1.xyz * p.y + i2.xyz * p.z + i3.xyz;
     let model = object.model;
-    let world = model[0].xyz * p.x + model[1].xyz * p.y + model[2].xyz * p.z + model[3].xyz;
+    let world = model[0].xyz * q.x + model[1].xyz * q.y + model[2].xyz * q.z + model[3].xyz;
     let m = object.model_view;
-    let view = m[0].xyz * p.x + m[1].xyz * p.y + m[2].xyz * p.z + m[3].xyz;
+    let view = m[0].xyz * q.x + m[1].xyz * q.y + m[2].xyz * q.z + m[3].xyz;
     let projection = globals.projection;
     var out: HighVarying;
     out.clip = vec4<f32>(view.xy * projection.xy, view.z * projection.z + projection.w, -view.z);
     out.uv = uv * object.uv_transform.xy + object.uv_transform.zw;
-    out.color = color;
+    out.color = color * tint.rgb;
+    out.alpha = tint.a;
     out.world = world;
-    out.normal = model[0].xyz * n.x + model[1].xyz * n.y + model[2].xyz * n.z;
+    let r = i0.xyz * n.x + i1.xyz * n.y + i2.xyz * n.z;
+    out.normal = model[0].xyz * r.x + model[1].xyz * r.y + model[2].xyz * r.z;
     out.fog_depth = -view.z;
     return out;
 }
@@ -199,7 +236,7 @@ fn fs_unlit_high(in: HighVarying) -> @location(0) vec4<f32> {
         color *= new_peak / peak;
         color = mix(color, vec3<f32>(new_peak), 1.0 - 1.0 / (0.15 * (peak - new_peak) + 1.0));
     }
-    return vec4<f32>(color, object.color.a * texel.a);
+    return vec4<f32>(color, object.color.a * texel.a * in.alpha);
 }
 
 @fragment
@@ -253,6 +290,6 @@ fn fs_lit_high(in: HighVarying) -> @location(0) vec4<f32> {
         color *= new_peak / peak;
         color = mix(color, vec3<f32>(new_peak), 1.0 - 1.0 / (0.15 * (peak - new_peak) + 1.0));
     }
-    return vec4<f32>(color, object.color.a * texel.a);
+    return vec4<f32>(color, object.color.a * texel.a * in.alpha);
 }
 

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::f32::consts::PI;
 use std::rc::Rc;
 
-use glam::{Mat4, Quat, Vec2, Vec3};
+use glam::{Mat4, Quat, Vec2, Vec3, Vec4};
 use slint::wgpu_30::wgpu;
 use wgpu::util::DeviceExt;
 
@@ -148,7 +148,21 @@ pub struct Object {
     pub material: Material,
     /// Transparent objects with a higher order draw later, whatever their distance.
     pub render_order: i32,
+    /// Draws the mesh once for each, all in one draw call. `None` draws it once.
+    pub instances: Option<Vec<Instance>>,
 }
+
+/// One copy of an instanced object's mesh.
+#[derive(Clone, Copy)]
+pub struct Instance {
+    /// Moves, rotates, and scales the copy within the object.
+    pub transform: Mat4,
+    /// Multiplies the material's color and opacity.
+    pub color: Vec4,
+}
+
+/// The floats of an instance's vertex inputs in `shader.wgsl`: its transform and color.
+const INSTANCE_FLOATS: usize = 16 + 4;
 
 impl Object {
     pub fn new(parent: Option<Node>, mesh: Option<Rc<Mesh>>, material: Material) -> Self {
@@ -161,6 +175,7 @@ impl Object {
             mesh,
             material,
             render_order: 0,
+            instances: None,
         }
     }
 
@@ -254,6 +269,14 @@ impl Scene {
         self.add(object)
     }
 
+    /// Adds `mesh` with `material`, drawn once for each of its instances, of which it has
+    /// none yet.
+    pub fn add_instanced(&mut self, mesh: &Rc<Mesh>, material: &Material) -> Node {
+        let node = self.add_mesh(None, mesh, material, Vec3::ZERO, Quat::IDENTITY, Vec3::ONE);
+        self.object(node).instances = Some(Vec::new());
+        node
+    }
+
     /// Adds an object that only groups and moves its children.
     pub fn group(&mut self, parent: Option<Node>) -> Node {
         self.add(Object::new(parent, None, Material::unlit(Vec3::ONE)))
@@ -330,6 +353,9 @@ pub struct Renderer {
     /// Each object's uniforms, `object_stride` bytes apart.
     objects: wgpu::Buffer,
     objects_bind_group: wgpu::BindGroup,
+    /// The instances of each frame's draws, after an untransformed white one that draws
+    /// objects without instances.
+    instances: wgpu::Buffer,
     object_stride: usize,
     texture_layout: wgpu::BindGroupLayout,
     samplers: [[wgpu::Sampler; 2]; 2],
@@ -500,6 +526,7 @@ impl Renderer {
             depth_format: depth_format(device),
             depth: None,
             multisampled: None,
+            instances: Self::instance_buffer(device, 64),
             light_map_pipeline,
             light_map_pools,
             light_map_bind_group,
@@ -578,6 +605,15 @@ impl Renderer {
             cache: None,
         });
         (pipeline, pools, bind_group)
+    }
+
+    fn instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("drone course instances"),
+            size: (capacity * INSTANCE_FLOATS * 4) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
     }
 
     fn object_buffer(
@@ -746,13 +782,23 @@ impl Renderer {
                     module: &self.shader,
                     entry_point: Some(vertex),
                     compilation_options: Default::default(),
-                    buffers: &[Some(wgpu::VertexBufferLayout {
-                        array_stride: (VERTEX_FLOATS * 4) as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![
-                            0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x3
-                        ],
-                    })],
+                    buffers: &[
+                        Some(wgpu::VertexBufferLayout {
+                            array_stride: (VERTEX_FLOATS * 4) as u64,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &wgpu::vertex_attr_array![
+                                0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x3
+                            ],
+                        }),
+                        Some(wgpu::VertexBufferLayout {
+                            array_stride: (INSTANCE_FLOATS * 4) as u64,
+                            step_mode: wgpu::VertexStepMode::Instance,
+                            attributes: &wgpu::vertex_attr_array![
+                                4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4,
+                                8 => Float32x4
+                            ],
+                        }),
+                    ],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &self.shader,
@@ -810,7 +856,16 @@ impl Renderer {
             let Some(object) = &scene.objects[index] else { continue };
             let Some(mesh) = &object.mesh else { continue };
             let Some(world) = scene.world_transform(index, &mut cache) else { continue };
-            let depth = (world.w_axis.truncate() - camera.translation).dot(forward);
+            // Instances sort by their mean position.
+            let center = match &object.instances {
+                None => world.w_axis.truncate(),
+                Some(instances) if instances.is_empty() => continue,
+                Some(instances) => {
+                    let sum: Vec3 = instances.iter().map(|i| i.transform.w_axis.truncate()).sum();
+                    world.transform_point3(sum / instances.len() as f32)
+                }
+            };
+            let depth = (center - camera.translation).dot(forward);
             let draw = (object, mesh, world, depth);
             if object.material.blend == Blend::Opaque {
                 opaque.push(draw);
@@ -857,12 +912,36 @@ impl Renderer {
 
         let stride_floats = self.object_stride / 4;
         let mut objects = vec![0f32; draws.len().max(1) * stride_floats];
+        let mut instances = Vec::new();
+        instances.extend(Mat4::IDENTITY.to_cols_array());
+        instances.extend([1.0; 4]);
+        // Each draw's first instance and their count.
+        let mut ranges = Vec::with_capacity(draws.len());
+        // Instances are placed relative to the camera, which keeps the vertex shader's
+        // numbers small near it, see `geometry::boxes`.
+        let at_camera = Mat4::from_translation(camera.translation);
+        let from_camera = Mat4::from_translation(-camera.translation);
         for (i, (object, _, world, _)) in draws.iter().enumerate() {
             let material = &object.material;
             let (roughness, metalness) = material.lit.unwrap_or((1.0, 0.0));
+            let model = match &object.instances {
+                Some(list) => {
+                    ranges.push((instances.len() / INSTANCE_FLOATS, list.len() as u32));
+                    for instance in list {
+                        instances
+                            .extend((from_camera * *world * instance.transform).to_cols_array());
+                        instances.extend(instance.color.to_array());
+                    }
+                    at_camera
+                }
+                None => {
+                    ranges.push((0, 1));
+                    *world
+                }
+            };
             let uniforms = &mut objects[i * stride_floats..i * stride_floats + OBJECT_FLOATS];
-            uniforms[..16].copy_from_slice(&world.to_cols_array());
-            uniforms[16..32].copy_from_slice(&(view * *world).to_cols_array());
+            uniforms[..16].copy_from_slice(&model.to_cols_array());
+            uniforms[16..32].copy_from_slice(&(view * model).to_cols_array());
             uniforms[32..36].copy_from_slice(&material.color.extend(material.opacity).to_array());
             uniforms[36..40].copy_from_slice(&[
                 material.uv_scale.x,
@@ -888,6 +967,11 @@ impl Renderer {
             );
         }
         self.queue.write_buffer(&self.objects, 0, bytemuck::cast_slice(&objects));
+        if (instances.len() * 4) as u64 > self.instances.size() {
+            let capacity = (instances.len() / INSTANCE_FLOATS).next_power_of_two();
+            self.instances = Self::instance_buffer(&self.device, capacity);
+        }
+        self.queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&instances));
 
         let mut keys: Vec<PipelineKey> = Vec::with_capacity(draws.len());
         for (object, ..) in &draws {
@@ -999,7 +1083,9 @@ impl Renderer {
             });
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
             let mut current_key = None;
-            for (i, ((object, mesh, ..), key)) in draws.iter().zip(&keys).enumerate() {
+            for (i, (((object, mesh, ..), key), &(first, count))) in
+                draws.iter().zip(&keys).zip(&ranges).enumerate()
+            {
                 if current_key != Some(*key) {
                     pass.set_pipeline(&self.pipelines[key]);
                     current_key = Some(*key);
@@ -1014,8 +1100,10 @@ impl Renderer {
                     pass.set_bind_group(3, &light_map.bind_groups[0], &[]);
                 }
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                let first = (first * INSTANCE_FLOATS * 4) as u64;
+                pass.set_vertex_buffer(1, self.instances.slice(first..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..count);
             }
         }
         self.queue.submit([encoder.finish()]);

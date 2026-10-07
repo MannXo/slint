@@ -7,13 +7,13 @@ use std::cell::RefCell;
 use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 use std::rc::Rc;
 
-use glam::{Quat, Vec2, Vec3, Vec3Swizzles};
+use glam::{Mat4, Quat, Vec2, Vec3, Vec3Swizzles, Vec4};
 use slint::wgpu_30::{WGPUConfiguration, WGPUSettings, wgpu};
 
 use course::{Course, HALL_HEIGHT, HALL_X, HALL_Z, SAMPLES};
 use renderer::{
-    Blend, Camera, Fog, Geometry, LightMap, Material, Mesh, Node, Object, Pool, Renderer, Scene,
-    SpotLight, Texture,
+    Blend, Camera, Fog, Geometry, Instance, LightMap, Material, Mesh, Node, Object, Pool, Renderer,
+    Scene, SpotLight, Texture,
 };
 use rivals::Rival;
 
@@ -870,61 +870,94 @@ fn route_ribbon(course: &Course) -> (Geometry, Vec3) {
 
 /// One gate's meshes, recolored to show which gate is next.
 struct GateMeshes {
-    bars: Node,
+    /// Where the frame's bars are, as transforms of a unit cube.
+    bars: Vec<Mat4>,
     halos: Vec<Node>,
     pool: Node,
     start: bool,
     base: Vec3,
 }
 
-struct Propeller {
-    node: Node,
-    // Diagonal propellers spin the same way, so the drone doesn't yaw.
-    direction: f32,
-    angle: f32,
+/// The propellers' places on the airframe, and which way each spins. Diagonal propellers
+/// spin the same way, so the drone doesn't yaw.
+fn propeller_places() -> [(Vec3, f32); 4] {
+    [(1.0, -1.0), (-1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+        .map(|(sx, sz)| (Vec3::new(sx * DRONE_ARM, 0.085, sz * DRONE_ARM), sx * sz))
 }
 
-/// A drone in the scene, with its shadow.
-struct DroneModel {
-    drone: Node,
-    airframe: Node,
-    propellers: Vec<Propeller>,
-    blob: Node,
+/// How far the motors are from the drone's center, sideways and lengthwise.
+const DRONE_ARM: f32 = 0.42 * 0.72;
+
+/// All drones, with each part drawn once for all of them.
+struct Drones {
+    /// The carbon frame, the motors, and the white and red lights.
+    bodies: [Node; 3],
+    /// The lights in each drone's team color.
+    team_lights: Node,
+    propellers: Node,
+    /// The soft shadows below the drones.
+    blobs: Node,
+    /// The angles of each drone's propellers.
+    angles: Vec<[f32; 4]>,
 }
 
-impl DroneModel {
+impl Drones {
+    /// Places a drone for each of `flights`, in its team color. The first is the player's,
+    /// whose propellers show only with `player_propellers`.
     fn place(
         &mut self,
         scene: &mut Scene,
-        flight: Flight,
+        flights: &[(Flight, Vec3)],
         spin: bool,
-        show_propellers: bool,
+        player_propellers: bool,
         dt: f32,
     ) {
-        scene.object(self.drone).place(
-            flight.position,
-            Quat::from_rotation_y(flight.yaw),
-            Vec3::ONE,
-        );
-        // Bank into turns and lean the nose down with speed.
-        let tilt = Quat::from_rotation_z(-flight.roll * 0.5)
-            * Quat::from_rotation_x(-flight.speed / BOOST_SPEED * 0.35);
-        scene.object(self.airframe).place(Vec3::ZERO, tilt, Vec3::splat(DRONE_SCALE));
-        // A soft shadow that grows and fades with height.
-        let height = flight.position.y;
-        let size = 1.2 + height * 0.18;
-        let blob = scene.object(self.blob);
-        blob.place(flight.position.with_y(0.035), Quat::IDENTITY, Vec3::new(size, 1.0, size));
-        blob.material.opacity = (0.75 - height * 0.05).clamp(0.08, 0.75);
-        for propeller in &mut self.propellers {
-            let object = scene.object(propeller.node);
-            object.visible = show_propellers;
-            if spin {
-                propeller.angle += propeller.direction * (40.0 + flight.speed * 3.0) * dt;
-                object.rotation =
-                    Quat::from_rotation_x(-FRAC_PI_2) * Quat::from_rotation_z(propeller.angle);
+        let (mut bodies, mut team_lights, mut propellers, mut blobs) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        self.angles.resize(flights.len(), [0.0; 4]);
+        for (index, (&(flight, team), angles)) in flights.iter().zip(&mut self.angles).enumerate() {
+            // Bank into turns and lean the nose down with speed.
+            let attitude = Quat::from_rotation_y(flight.yaw)
+                * Quat::from_rotation_z(-flight.roll * 0.5)
+                * Quat::from_rotation_x(-flight.speed / BOOST_SPEED * 0.35);
+            let airframe = Mat4::from_scale_rotation_translation(
+                Vec3::splat(DRONE_SCALE),
+                attitude,
+                flight.position,
+            );
+            bodies.push(Instance { transform: airframe, color: Vec4::ONE });
+            team_lights.push(Instance { transform: airframe, color: team.extend(1.0) });
+            for ((place, direction), angle) in propeller_places().into_iter().zip(angles) {
+                if spin {
+                    *angle += direction * (40.0 + flight.speed * 3.0) * dt;
+                }
+                if index > 0 || player_propellers {
+                    let rotation =
+                        Quat::from_rotation_x(-FRAC_PI_2) * Quat::from_rotation_z(*angle);
+                    propellers.push(Instance {
+                        transform: airframe * Mat4::from_rotation_translation(rotation, place),
+                        color: Vec4::ONE,
+                    });
+                }
             }
+            // A soft shadow that grows and fades with height.
+            let height = flight.position.y;
+            let size = 1.2 + height * 0.18;
+            blobs.push(Instance {
+                transform: Mat4::from_scale_rotation_translation(
+                    Vec3::new(size, 1.0, size),
+                    Quat::IDENTITY,
+                    flight.position.with_y(0.035),
+                ),
+                color: Vec3::ONE.extend((0.75 - height * 0.05).clamp(0.08, 0.75)),
+            });
         }
+        for node in self.bodies {
+            scene.object(node).instances = Some(bodies.clone());
+        }
+        scene.object(self.team_lights).instances = Some(team_lights);
+        scene.object(self.propellers).instances = Some(propellers);
+        scene.object(self.blobs).instances = Some(blobs);
     }
 }
 
@@ -943,14 +976,11 @@ struct World {
     camera: Camera,
     floor_spot: Rc<Mesh>,
     halo: Rc<Mesh>,
-    tower_mesh: Rc<Mesh>,
-    steel: Material,
     halo_texture: Rc<Texture>,
     radial_texture: Rc<Texture>,
     route: Material,
     tower: Material,
     tower_pool: Material,
-    pad: Material,
     perimeter: Node,
     ceiling_lights: Node,
     shafts: Vec<Node>,
@@ -963,10 +993,13 @@ struct World {
     course: Node,
     gates: Vec<GateMeshes>,
     route_mesh: Option<Node>,
-    towers: Vec<Node>,
+    /// The gates' frames and the posts they stand on, the LED towers, and the launch pads.
+    gate_bars: Node,
+    gate_posts: Node,
+    towers: Node,
+    pads: Node,
     tower_pools: Vec<Node>,
-    player: DroneModel,
-    rivals: Vec<DroneModel>,
+    drones: Drones,
     trail: Rc<Mesh>,
     trail_node: Node,
     trail_geometry: Geometry,
@@ -1163,35 +1196,27 @@ impl World {
         let screen_mesh = renderer.create_mesh(&geometry::plane(20.0, 10.0));
         // The logo's aspect ratio, 423 x 126.
         let logo_mesh = renderer.create_mesh(&geometry::plane(12.0, 12.0 * 126.0 / 423.0));
+        let frames = scene.add_instanced(&unit_cube, &steel);
+        let screens = scene.add_instanced(&screen_mesh, &screen);
+        let logos = scene.add_instanced(&logo_mesh, &logo_material);
         for (position, rotation) in [
             (Vec3::new(0.0, 12.0, -hz + 0.2), Quat::IDENTITY),
             (Vec3::new(-hx + 0.2, 12.0, 0.0), Quat::from_rotation_y(FRAC_PI_2)),
         ] {
             let facing = rotation * Vec3::Z;
-            scene.add_mesh(
-                None,
-                &unit_cube,
-                &steel,
-                position - facing * 0.15,
-                rotation,
-                Vec3::new(20.6, 10.6, 0.3),
-            );
-            scene.add_mesh(
-                None,
-                &screen_mesh,
-                &screen,
-                position + facing * 0.01,
-                rotation,
-                Vec3::ONE,
-            );
-            scene.add_mesh(
-                None,
-                &logo_mesh,
-                &logo_material,
-                position + facing * 0.02,
-                rotation,
-                Vec3::ONE,
-            );
+            for (node, offset, scale) in [
+                (frames, -0.15, Vec3::new(20.6, 10.6, 0.3)),
+                (screens, 0.01, Vec3::ONE),
+                (logos, 0.02, Vec3::ONE),
+            ] {
+                let transform = Mat4::from_scale_rotation_translation(
+                    scale,
+                    rotation,
+                    position + facing * offset,
+                );
+                let instance = Instance { transform, color: Vec4::ONE };
+                scene.object(node).instances.get_or_insert_default().push(instance);
+            }
         }
 
         scene.lights.sky = hex(0x8fa3b8, 1.0);
@@ -1209,35 +1234,16 @@ impl World {
         };
         let tower_pool = additive(&radial_texture, hex(0xffb347, 0.35));
         let pad = standard(Vec3::ONE, 0.6, 0.0, Some(renderer.create_texture(&textures::pad())));
+        let gate_bars = scene.add_instanced(&unit_cube, &Material::unlit(Vec3::ONE));
+        let gate_posts = scene.add_instanced(&unit_cube, &steel);
+        let towers = scene.add_instanced(
+            &renderer.create_mesh(&geometry::cylinder(0.55, 0.55, 14.0, 16)),
+            &tower,
+        );
+        let pads =
+            scene.add_instanced(&renderer.create_mesh(&geometry::plane(PAD_SIZE, PAD_SIZE)), &pad);
 
-        let blob_material = Material {
-            texture: Some(radial_texture.clone()),
-            blend: Blend::Alpha,
-            depth_write: false,
-            opacity: 0.75,
-            ..Material::unlit(Vec3::ZERO)
-        };
-        let propeller = Material {
-            texture: Some(renderer.create_texture(&textures::propeller())),
-            blend: Blend::Alpha,
-            depth_write: false,
-            double_sided: true,
-            ..Material::unlit(Vec3::ONE)
-        };
-        let drone = |scene: &mut Scene, team: u32| {
-            let (drone, airframe, propellers) = Self::drone(scene, renderer, &propeller, team);
-            let blob = scene.add_mesh(
-                None,
-                &floor_spot,
-                &blob_material,
-                Vec3::ZERO,
-                Quat::IDENTITY,
-                Vec3::ONE,
-            );
-            DroneModel { drone, airframe, propellers, blob }
-        };
-        let player = drone(&mut scene, SLINT_BLUE);
-        let rivals = rivals::PILOTS.iter().map(|pilot| drone(&mut scene, pilot.color)).collect();
+        let drones = Self::drones(&mut scene, renderer, &floor_spot, &radial_texture);
 
         let trail_geometry = Self::trail_geometry();
         let trail = renderer.create_mesh(&trail_geometry);
@@ -1268,14 +1274,11 @@ impl World {
                 textures::HALO_OUTLINE - textures::HALO_REACH,
                 textures::HALO_OUTLINE + textures::HALO_REACH,
             )),
-            tower_mesh: renderer.create_mesh(&geometry::cylinder(0.55, 0.55, 14.0, 16)),
-            steel,
             halo_texture,
             radial_texture,
             route,
             tower,
             tower_pool,
-            pad,
             perimeter,
             ceiling_lights,
             shafts,
@@ -1287,10 +1290,12 @@ impl World {
             course,
             gates: Vec::new(),
             route_mesh: None,
-            towers: Vec::new(),
+            gate_bars,
+            gate_posts,
+            towers,
+            pads,
             tower_pools: Vec::new(),
-            player,
-            rivals,
+            drones,
             trail,
             trail_node,
             trail_geometry,
@@ -1303,35 +1308,31 @@ impl World {
         }
     }
 
-    /// The racing drone, about 0.9 m across including propellers, with its nose towards -Z.
-    fn drone(
+    /// The racing drones, about 0.9 m across including propellers, with their noses towards
+    /// -Z, and their shadows.
+    fn drones(
         scene: &mut Scene,
         renderer: &Renderer,
-        propeller: &Material,
-        team: u32,
-    ) -> (Node, Node, Vec<Propeller>) {
+        floor_spot: &Rc<Mesh>,
+        radial_texture: &Rc<Texture>,
+    ) -> Drones {
         let carbon = standard(hex(0x1b1e23, 1.0), 0.45, 0.35, None);
         let metal = standard(hex(0x7d838c, 1.0), 0.25, 0.95, None);
         let white_led = Vec3::new(2.2, 2.3, 2.5);
         let red_led = Vec3::new(2.5, 0.15, 0.1);
-        let team_led = hex(team, 1.6);
-        let status_light = hex(team, 1.5);
+        // Times the team color.
+        let (team_led, status_light) = (Vec3::splat(1.6), Vec3::splat(1.5));
 
-        let drone = scene.group(None);
-        let airframe = scene.group(Some(drone));
-        let arm = 0.42;
-        let disc = renderer.create_mesh(&geometry::circle(0.24, 24));
-        // Parts that share a material are one mesh each, which saves draws on small GPUs:
-        // the lights in their colors, the carbon frame, and the motors.
         let (cube, _) = geometry::boxes(&[(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE)]);
         let motor = geometry::cylinder(0.05, 0.05, 0.06, 14);
-        let mut lights = vec![
-            (
-                (Vec3::new(0.0, 0.165, 0.03), Quat::IDENTITY, Vec3::new(0.125, 0.03, 0.18)),
-                status_light,
-            ),
-            ((Vec3::new(0.0, 0.03, 0.18), Quat::IDENTITY, Vec3::new(0.09, 0.02, 0.02)), red_led),
-        ];
+        let mut lights = vec![(
+            (Vec3::new(0.0, 0.03, 0.18), Quat::IDENTITY, Vec3::new(0.09, 0.02, 0.02)),
+            red_led,
+        )];
+        let mut team_lights = vec![(
+            (Vec3::new(0.0, 0.165, 0.03), Quat::IDENTITY, Vec3::new(0.125, 0.03, 0.18)),
+            status_light,
+        )];
         let mut carbon_parts = vec![
             (Vec3::new(0.0, 0.035, 0.0), Quat::IDENTITY, Vec3::new(0.2, 0.06, 0.34)),
             (Vec3::new(0.0, 0.11, 0.03), Quat::IDENTITY, Vec3::new(0.12, 0.08, 0.22)),
@@ -1345,65 +1346,59 @@ impl World {
             carbon_parts.push((
                 Vec3::ZERO,
                 Quat::from_rotation_y(angle),
-                Vec3::new(0.07, 0.028, arm * 2.15),
+                Vec3::new(0.07, 0.028, 0.42 * 2.15),
             ));
         }
         let mut motors = Vec::new();
-        let mut propellers = Vec::new();
-        for (sx, sz) in [(1.0, -1.0), (-1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
-            let (x, z) = (sx * arm * 0.72, sz * arm * 0.72);
-            motors.push(((Vec3::new(x, 0.04, z), Quat::IDENTITY, Vec3::ONE), Vec3::ONE));
+        for (place, _) in propeller_places() {
+            let (x, z) = (place.x, place.z);
+            motors.push((Vec3::new(x, 0.04, z), Quat::IDENTITY, Vec3::ONE));
             // LED strips under the arms: white at the front, team color at the back.
-            lights.push((
-                (
-                    Vec3::new(x * 0.6, -0.02, z * 0.6),
-                    Quat::from_rotation_y(f32::atan2(x, z)),
-                    Vec3::new(0.05, 0.012, 0.26),
-                ),
-                if sz < 0.0 { white_led } else { team_led },
-            ));
-            let position = Vec3::new(x, 0.085, z);
-            let node = scene.add_mesh(
-                Some(airframe),
-                &disc,
-                propeller,
-                position,
-                Quat::from_rotation_x(-FRAC_PI_2),
-                Vec3::ONE,
+            let strip = (
+                Vec3::new(x * 0.6, -0.02, z * 0.6),
+                Quat::from_rotation_y(f32::atan2(x, z)),
+                Vec3::new(0.05, 0.012, 0.26),
             );
-            scene.object(node).render_order = 2;
-            propellers.push(Propeller { node, direction: sx * sz, angle: 0.0 });
+            if z < 0.0 {
+                lights.push((strip, white_led));
+            } else {
+                team_lights.push((strip, team_led));
+            }
         }
-        let lights =
-            geometry::merge(lights.into_iter().map(|(place, color)| (&cube, place, color)));
-        scene.add_mesh(
-            Some(airframe),
-            &renderer.create_mesh(&lights),
-            &Material::unlit(Vec3::ONE),
-            Vec3::ZERO,
-            Quat::IDENTITY,
-            Vec3::ONE,
-        );
-        let (carbon_geometry, center) = geometry::boxes(&carbon_parts);
-        scene.add_mesh(
-            Some(airframe),
-            &renderer.create_mesh(&carbon_geometry),
-            &carbon,
-            center,
-            Quat::IDENTITY,
-            Vec3::ONE,
-        );
-        let motors =
-            geometry::merge(motors.into_iter().map(|(place, color)| (&motor, place, color)));
-        scene.add_mesh(
-            Some(airframe),
-            &renderer.create_mesh(&motors),
-            &metal,
-            Vec3::ZERO,
-            Quat::IDENTITY,
-            Vec3::ONE,
-        );
-        (drone, airframe, propellers)
+
+        let merged = |parts: Vec<((Vec3, Quat, Vec3), Vec3)>, part: &Geometry| {
+            renderer.create_mesh(&geometry::merge(
+                parts.into_iter().map(|(place, color)| (part, place, color)),
+            ))
+        };
+        let white = |parts: Vec<(Vec3, Quat, Vec3)>| {
+            parts.into_iter().map(|place| (place, Vec3::ONE)).collect::<Vec<_>>()
+        };
+        let unlit = Material::unlit(Vec3::ONE);
+        let bodies = [
+            scene.add_instanced(&merged(white(carbon_parts), &cube), &carbon),
+            scene.add_instanced(&merged(white(motors), &motor), &metal),
+            scene.add_instanced(&merged(lights, &cube), &unlit),
+        ];
+        let team_lights = scene.add_instanced(&merged(team_lights, &cube), &unlit);
+        let propeller = Material {
+            texture: Some(renderer.create_texture(&textures::propeller())),
+            blend: Blend::Alpha,
+            depth_write: false,
+            double_sided: true,
+            ..Material::unlit(Vec3::ONE)
+        };
+        let propellers =
+            scene.add_instanced(&renderer.create_mesh(&geometry::circle(0.24, 24)), &propeller);
+        let blob = Material {
+            texture: Some(radial_texture.clone()),
+            blend: Blend::Alpha,
+            depth_write: false,
+            ..Material::unlit(Vec3::ZERO)
+        };
+        let blobs = scene.add_instanced(floor_spot, &blob);
+        scene.object(propellers).render_order = 2;
+        Drones { bodies, team_lights, propellers, blobs, angles: Vec::new() }
     }
 
     fn trail_geometry() -> Geometry {
@@ -1445,12 +1440,11 @@ impl World {
     fn show_course(&mut self, renderer: &Renderer, course: &Course) {
         self.scene.clear(self.course);
         self.gates.clear();
-        self.towers.clear();
         self.tower_pools.clear();
         let colors = palette(self.look.unwrap_or(0));
+        let mut posts = Vec::new();
         for gate in &course.gates {
             let base = hex(if gate.start { colors.start_gate } else { colors.gate }, 1.0);
-            let bars_material = Material::unlit(base);
             let halo_material = additive(&self.halo_texture, base);
             let pool_material = additive(&self.radial_texture, base);
             let rotation = Quat::from_rotation_y(gate.yaw());
@@ -1465,7 +1459,11 @@ impl World {
                     (w, height, 0.18, 2.0 * w),
                 ] {
                     let position = (gate.center + gate.right * offset).with_y(y);
-                    frame_bars.push((position, rotation, Vec3::new(size_x, size_y, 0.18)));
+                    frame_bars.push(Mat4::from_scale_rotation_translation(
+                        Vec3::new(size_x, size_y, 0.18),
+                        rotation,
+                        position,
+                    ));
                 }
                 let halo = self.halo.clone();
                 halos.push(self.add(
@@ -1476,22 +1474,20 @@ impl World {
                     Vec3::new(w * 4.4, w * 4.4, 1.0),
                 ));
             }
-            let (bars_geometry, center) = geometry::boxes(&frame_bars);
-            let bars_mesh = renderer.create_mesh(&bars_geometry);
-            let bars = self.add(&bars_mesh, &bars_material, center, Quat::IDENTITY, Vec3::ONE);
             let bottom = gate.center.y - w;
             if bottom > 0.2 {
-                let posts: Vec<_> = [-1.0, 1.0]
-                    .map(|side| {
-                        let position =
-                            (gate.center + gate.right * side * (w + 0.25)).with_y(bottom / 2.0);
-                        (position, rotation, Vec3::new(0.14, bottom, 0.14))
-                    })
-                    .into();
-                let (posts_geometry, center) = geometry::boxes(&posts);
-                let posts_mesh = renderer.create_mesh(&posts_geometry);
-                let steel = self.steel.clone();
-                self.add(&posts_mesh, &steel, center, Quat::IDENTITY, Vec3::ONE);
+                for side in [-1.0, 1.0] {
+                    let position =
+                        (gate.center + gate.right * side * (w + 0.25)).with_y(bottom / 2.0);
+                    posts.push(Instance {
+                        transform: Mat4::from_scale_rotation_translation(
+                            Vec3::new(0.14, bottom, 0.14),
+                            rotation,
+                            position,
+                        ),
+                        color: Vec4::ONE,
+                    });
+                }
             }
             let floor_spot = self.floor_spot.clone();
             let pool = self.add(
@@ -1501,13 +1497,15 @@ impl World {
                 Quat::IDENTITY,
                 Vec3::new(w * 5.0, 1.0, w * 5.0),
             );
-            self.gates.push(GateMeshes { bars, halos, pool, start: gate.start, base });
+            self.gates.push(GateMeshes { bars: frame_bars, halos, pool, start: gate.start, base });
         }
+        self.scene.object(self.gate_posts).instances = Some(posts);
+        let towers = course.towers.iter().map(|position| Instance {
+            transform: Mat4::from_translation(*position + Vec3::Y * 7.0),
+            color: Vec4::ONE,
+        });
+        self.scene.object(self.towers).instances = Some(towers.collect());
         for position in &course.towers {
-            let (tower_mesh, tower) = (self.tower_mesh.clone(), self.tower.clone());
-            let tower =
-                self.add(&tower_mesh, &tower, *position + Vec3::Y * 7.0, Quat::IDENTITY, Vec3::ONE);
-            self.towers.push(tower);
             let (floor_spot, tower_pool) = (self.floor_spot.clone(), self.tower_pool.clone());
             let pool = self.add(
                 &floor_spot,
@@ -1524,21 +1522,18 @@ impl World {
         let route = self.route.clone();
         self.route_mesh = Some(self.add(&route_mesh, &route, center, Quat::IDENTITY, Vec3::ONE));
 
-        let index = launch_index(course);
-        let pad_mesh = renderer.create_mesh(&geometry::plane(PAD_SIZE, PAD_SIZE));
-        let pad = self.pad.clone();
-        for slot in 0..=rivals::PILOTS.len() {
+        let rotation =
+            Quat::from_rotation_y(yaw_towards(course.tangents[launch_index(course)]) + PI)
+                * Quat::from_rotation_x(-FRAC_PI_2);
+        let pads = (0..=rivals::PILOTS.len()).map(|slot| {
             let (position, _) = rivals::grid_slot(course, slot);
-            self.add(
-                &pad_mesh,
-                &pad,
+            Instance {
                 // Below the light pools, so they light it.
-                position.with_y(0.015),
-                Quat::from_rotation_y(yaw_towards(course.tangents[index]) + PI)
-                    * Quat::from_rotation_x(-FRAC_PI_2),
-                Vec3::ONE,
-            );
-        }
+                transform: Mat4::from_rotation_translation(rotation, position.with_y(0.015)),
+                color: Vec4::ONE,
+            }
+        });
+        self.scene.object(self.pads).instances = Some(pads.collect());
         // Makes `apply_look` color the new course.
         self.look = None;
     }
@@ -1565,7 +1560,7 @@ impl World {
         self.tower.color = hex(colors.tower, 0.9);
         self.tower_pool.color = hex(colors.tower, 0.25);
         recolor(self.route_mesh.as_slice(), self.route.color);
-        recolor(&self.towers, self.tower.color);
+        recolor(&[self.towers], self.tower.color);
         recolor(&self.tower_pools, self.tower_pool.color);
         for gate in &mut self.gates {
             gate.base = hex(if gate.start { colors.start_gate } else { colors.gate }, 1.0);
@@ -1593,6 +1588,7 @@ impl World {
     /// Halos fade out near the camera, where they'd cover most of the view.
     fn light_gates(&mut self, race: &Race, high_quality: bool) {
         let camera = self.camera.translation;
+        let mut bars = Vec::new();
         for (index, gate) in self.gates.iter().enumerate() {
             let next = race.phase == Phase::Flying && index == race.next_gate;
             let color = if race.phase != Phase::Flying || index > race.next_gate {
@@ -1603,8 +1599,9 @@ impl World {
                 gate.base * 0.3
             };
             // The frame, its halo, and the pool of light below it.
-            let (bars, halo, pool) = if next { (1.6, 0.6, 0.5) } else { (1.15, 0.4, 0.35) };
-            self.scene.object(gate.bars).material.color = color * bars;
+            let (frame, halo, pool) = if next { (1.6, 0.6, 0.5) } else { (1.15, 0.4, 0.35) };
+            let tint = (color * frame).extend(1.0);
+            bars.extend(gate.bars.iter().map(|&transform| Instance { transform, color: tint }));
             let shown = high_quality || self.switches.all_halos;
             for &node in &gate.halos {
                 let object = self.scene.object(node);
@@ -1623,6 +1620,7 @@ impl World {
             }
             self.scene.object(gate.pool).material.color = color * pool;
         }
+        self.scene.object(self.gate_bars).instances = Some(bars);
     }
 
     /// In low quality, bakes the pools of light into the floor's light map, instead of
@@ -1666,19 +1664,21 @@ impl World {
         }
 
         let spin = race.phase != Phase::Ready;
-        let flight =
+        let player =
             Flight { position: race.position, yaw: race.yaw, roll: race.roll, speed: race.speed };
-        // From the onboard camera, the propellers would blur over the view.
-        self.player.place(&mut self.scene, flight, spin, !state.fpv, dt);
-        for (model, rival) in self.rivals.iter_mut().zip(&race.rivals) {
-            let flight = Flight {
-                position: rival.position,
-                yaw: rival.yaw,
-                roll: rival.roll,
-                speed: rival.speed,
-            };
-            model.place(&mut self.scene, flight, spin, true, dt);
-        }
+        let flights: Vec<(Flight, Vec3)> = std::iter::once((player, hex(SLINT_BLUE, 1.0)))
+            .chain(race.rivals.iter().map(|rival| {
+                let flight = Flight {
+                    position: rival.position,
+                    yaw: rival.yaw,
+                    roll: rival.roll,
+                    speed: rival.speed,
+                };
+                (flight, hex(rival.pilot.color, 1.0))
+            }))
+            .collect();
+        // From the onboard camera, the player's propellers would blur over the view.
+        self.drones.place(&mut self.scene, &flights, spin, !state.fpv, dt);
 
         let ahead = forward(race.yaw);
         let (eye, rotation, fov) = if state.fpv {
