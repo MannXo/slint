@@ -494,6 +494,7 @@ impl crate::Surface for WGPUSurface {
             self.wgpu.instance.clone(),
             self.wgpu.device.clone(),
             self.wgpu.queue.clone(),
+            None,
         );
         callback(api)
     }
