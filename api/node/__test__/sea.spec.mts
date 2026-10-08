@@ -86,7 +86,8 @@ function packageAndRun(
             execFileSync(executable, { cwd: os.tmpdir(), encoding: "utf8" }),
         );
     } finally {
-        fs.rmSync(root, { recursive: true, force: true });
+        // Windows holds on to a file of a process that just exited for a moment.
+        fs.rmSync(root, { recursive: true, force: true, maxRetries: 10 });
     }
 }
 
