@@ -111,15 +111,18 @@ impl SkiaWGPU29Renderer {
 
     /// Render the scene to the given texture.
     ///
-    /// The texture must have been created with `RENDER_ATTACHMENT` usage and have a supported
-    /// format. Supported formats depend on the GPU backend: `Rgba8Unorm` and `Rgba8UnormSrgb`
-    /// are supported on all backends; `Bgra8Unorm` is additionally supported on Metal and Vulkan.
+    /// Create the texture with `RENDER_ATTACHMENT`, `COPY_SRC`, and `COPY_DST` usage:
+    /// Skia copies from and into its render targets for some of its drawing.
+    /// The texture must have a supported format. Supported formats depend on the GPU backend:
+    /// `Rgba8Unorm` and `Rgba8UnormSrgb` are supported on all backends; `Bgra8Unorm` is
+    /// additionally supported on Metal and Vulkan.
     pub fn render_to_texture(&self, texture: &wgpu_29::Texture) -> Result<(), PlatformError> {
         let surface = self.surface();
         self.renderer.invoke_rendering_notifier_setup(&*surface)?;
 
         let gr_context = &mut surface.gr_context.borrow_mut();
 
+        surface.transition_to_color_target(texture)?;
         let mut skia_surface =
             surface.backend.make_surface(gr_context, texture).ok_or_else(|| {
                 PlatformError::from("Failed to wrap WGPU texture as Skia render target")
@@ -139,6 +142,7 @@ impl SkiaWGPU29Renderer {
             None,
         );
 
+        surface.backend.release_surface(gr_context, &mut skia_surface);
         surface.flush_and_submit(gr_context);
 
         Ok(())
@@ -175,15 +179,18 @@ impl SkiaWGPU30Renderer {
 
     /// Render the scene to the given texture.
     ///
-    /// The texture must have been created with `RENDER_ATTACHMENT` usage and have a supported
-    /// format. Supported formats depend on the GPU backend: `Rgba8Unorm` and `Rgba8UnormSrgb`
-    /// are supported on all backends; `Bgra8Unorm` is additionally supported on Metal and Vulkan.
+    /// Create the texture with `RENDER_ATTACHMENT`, `COPY_SRC`, and `COPY_DST` usage:
+    /// Skia copies from and into its render targets for some of its drawing.
+    /// The texture must have a supported format. Supported formats depend on the GPU backend:
+    /// `Rgba8Unorm` and `Rgba8UnormSrgb` are supported on all backends; `Bgra8Unorm` is
+    /// additionally supported on Metal and Vulkan.
     pub fn render_to_texture(&self, texture: &wgpu_30::Texture) -> Result<(), PlatformError> {
         let surface = self.surface();
         self.renderer.invoke_rendering_notifier_setup(&*surface)?;
 
         let gr_context = &mut surface.gr_context.borrow_mut();
 
+        surface.transition_to_color_target(texture)?;
         let mut skia_surface =
             surface.backend.make_surface(gr_context, texture).ok_or_else(|| {
                 PlatformError::from("Failed to wrap WGPU texture as Skia render target")
@@ -203,6 +210,7 @@ impl SkiaWGPU30Renderer {
             None,
         );
 
+        surface.backend.release_surface(gr_context, &mut skia_surface);
         surface.flush_and_submit(gr_context);
 
         Ok(())

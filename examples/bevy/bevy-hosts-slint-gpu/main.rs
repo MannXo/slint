@@ -350,6 +350,7 @@ fn setup(
             mip_level_count: 1,
             sample_count: 1,
             usage: TextureUsages::TEXTURE_BINDING
+                | TextureUsages::COPY_SRC
                 | TextureUsages::COPY_DST
                 | TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
