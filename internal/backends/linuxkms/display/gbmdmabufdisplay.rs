@@ -20,10 +20,11 @@ use wgpu_30 as wgpu;
 
 use crate::drmoutput::{DrmOutput, OwnedFramebufferHandle, SharedFd};
 
-/// Number of buffers in the ring. A frame is drawn while the previous one is
-/// still on its way to the screen, so at any moment one buffer is being rendered
-/// into, one is mid-flip and one is on screen.
-pub const BUFFER_COUNT: usize = 3;
+/// Number of buffers in the ring. With [`GbmDmabufDisplay::present_after`], a frame
+/// is drawn while the GPU still finishes the previous one and the one before that
+/// is still on its way to the screen, so at any moment one buffer is being drawn
+/// into, one waits for the GPU, one is mid-flip and one is on screen.
+pub const BUFFER_COUNT: usize = 4;
 
 /// The scanout format. `Xrgb8888` is the one format every DRM plane is required
 /// to support, and its byte order matches wgpu's `Bgra8Unorm`.
@@ -69,6 +70,10 @@ pub struct GbmDmabufDisplay {
     buffers: [Buffer; BUFFER_COUNT],
     /// Index into `buffers` of the buffer to render the next frame into.
     next: Cell<usize>,
+    /// A frame [`Self::present_after`] hasn't posted yet: its buffer's index, and
+    /// the submission that finishes drawing it.
+    #[cfg_attr(not(skia_wgpu_30), allow(dead_code))]
+    pending: Cell<Option<(usize, wgpu::SubmissionIndex)>>,
 }
 
 impl GbmDmabufDisplay {
@@ -119,7 +124,7 @@ impl GbmDmabufDisplay {
             .try_into()
             .unwrap_or_else(|_| unreachable!("the loop pushes exactly BUFFER_COUNT buffers"));
 
-        Ok(Self { drm_output, buffers, next: Cell::new(0) })
+        Ok(Self { drm_output, buffers, next: Cell::new(0), pending: Cell::new(None) })
     }
 
     fn allocate_buffer(
@@ -213,8 +218,58 @@ impl GbmDmabufDisplay {
         (index, &self.buffers[index].texture)
     }
 
+    /// Advances the ring, and posts the back buffer once `submission` completed: the
+    /// next time this is called, or in [`Self::flush`].
+    ///
+    /// Posting a frame only when the next one has been drawn lets the GPU finish it
+    /// while the CPU draws the next one, at the cost of a frame of latency. Call
+    /// [`Self::flush`] when no frame follows right away.
+    #[cfg_attr(not(skia_wgpu_30), allow(dead_code))]
+    pub fn present_after(
+        &self,
+        device: &wgpu::Device,
+        submission: wgpu::SubmissionIndex,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let previous = self.pending.replace(Some((self.next.get(), submission)));
+        self.next.set((self.next.get() + 1) % BUFFER_COUNT);
+        match previous {
+            Some(previous) => self.post(device, previous),
+            None => Ok(()),
+        }
+    }
+
+    /// Posts the frame [`Self::present_after`] left pending, if any.
+    #[cfg_attr(not(skia_wgpu_30), allow(dead_code))]
+    pub fn flush(
+        &self,
+        device: &wgpu::Device,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match self.pending.take() {
+            Some(pending) => self.post(device, pending),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg_attr(not(skia_wgpu_30), allow(dead_code))]
+    fn post(
+        &self,
+        device: &wgpu::Device,
+        (index, submission): (usize, wgpu::SubmissionIndex),
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // KMS has no way to wait on the render: wgpu-hal exports no sync fd for
+        // the plane's IN_FENCE_FD property. A wgpu submission's fence only signals
+        // once everything submitted to the queue before it completed, including
+        // what Skia submitted directly.
+        device.poll(wgpu::PollType::Wait { submission_index: Some(submission), timeout: None })?;
+        // A flip can only be queued once the last one landed. That one also took
+        // the frame before last off screen, whose buffer is drawn into next.
+        self.drm_output.wait_for_page_flip();
+        self.drm_output.present_framebuffer(self.buffers[index].framebuffer.handle)
+    }
+
     /// Posts the back buffer and advances the ring. The caller must have waited
     /// for the GPU work writing it to complete.
+    #[cfg_attr(not(feature = "renderer-femtovg-wgpu"), allow(dead_code))]
     pub fn present(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let index = self.next.get();
         // Waiting here rather than before the frame was drawn overlaps rendering

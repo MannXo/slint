@@ -28,6 +28,11 @@ pub trait FullscreenRenderer {
         rotation: RenderingRotation,
         draw_mouse_cursor_callback: &dyn Fn(&mut dyn ItemRenderer),
     ) -> Result<DrawOutcome, PlatformError>;
+    /// Puts a frame that [`Self::render_and_present`] left pending on the screen.
+    /// Called when no further frame follows right away.
+    fn flush_pending_frame(&self) -> Result<(), PlatformError> {
+        Ok(())
+    }
     fn size(&self) -> PhysicalWindowSize;
 }
 
@@ -175,6 +180,8 @@ impl FullscreenWindowAdapter {
                         this.request_redraw();
                     },
                 )
+            } else if !self.redraw_requested.get() {
+                self.renderer.flush_pending_frame()?;
             }
         }
         Ok(())

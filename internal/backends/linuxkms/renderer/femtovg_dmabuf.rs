@@ -4,7 +4,7 @@
 //! FemtoVG on wgpu for drivers without `VK_EXT_acquire_drm_display`.
 //!
 //! Same shape as [`super::skia_dmabuf`], but FemtoVG draws through wgpu, see
-//! [`ScanoutBarriers`].
+//! [`ScanoutBarriers`], and waits for the GPU after each frame.
 
 // cSpell: ignore bufs dmabuf
 
@@ -62,8 +62,8 @@ impl crate::fullscreenwindowadapter::FullscreenRenderer for FemtoVGDmabufRendere
         rotation: RenderingRotation,
         draw_mouse_cursor_callback: &dyn Fn(&mut dyn ItemRenderer),
     ) -> Result<DrawOutcome, PlatformError> {
-        // The buffer to draw into is two flips old, so the frame can be drawn
-        // while the previous one is still on its way to the screen.
+        // The buffer to draw into left the screen at least one flip ago, so the
+        // frame can be drawn while the previous one is still on its way there.
         // `GbmDmabufDisplay::present` waits for that flip.
         let (index, texture) = self.display.back_buffer();
 

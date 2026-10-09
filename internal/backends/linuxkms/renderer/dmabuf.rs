@@ -55,6 +55,7 @@ fn instance_descriptor() -> wgpu::InstanceDescriptor {
 /// the raw queue and submits last, and the scanout barriers submit there too, so a
 /// frame could reach the display before the GPU finished it. Waiting on the queue
 /// itself covers every submitter.
+#[cfg_attr(not(feature = "renderer-femtovg-wgpu"), allow(dead_code))]
 pub fn wait_for_gpu(device: &wgpu::Device) -> Result<(), PlatformError> {
     // Safety: the queue is only waited on. Nothing else submits to it concurrently;
     // rendering is single-threaded.

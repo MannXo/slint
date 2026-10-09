@@ -21,7 +21,9 @@
 //! first. Skia draws through its own Vulkan access. Before it does, wgpu records the
 //! image as a color target, the layout the acquire leaves it in.
 
-// cSpell: ignore dmabuf subresource
+// cSpell: ignore dmabuf subresource unsignaled
+
+use std::cell::Cell;
 
 use ash::vk;
 use i_slint_core::platform::PlatformError;
@@ -37,10 +39,15 @@ const COLOR_SUBRESOURCE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
     layer_count: 1,
 };
 
-/// The command buffers of one scanout buffer, re-recorded every time it's drawn into.
+/// The command buffers of one scanout buffer, re-recorded every time it's drawn into,
+/// once `fence` signaled that the last release finished.
 struct Slot {
     acquire: vk::CommandBuffer,
     release: vk::CommandBuffer,
+    fence: vk::Fence,
+    /// Whether a submitted release is still to signal `fence`. A failed submit leaves
+    /// the fence unsignaled with nothing on the way to signal it.
+    fence_pending: Cell<bool>,
 }
 
 pub struct ScanoutBarriers {
@@ -64,8 +71,8 @@ impl ScanoutBarriers {
         buffer_count: usize,
         drawn_by_wgpu: bool,
     ) -> Result<Self, PlatformError> {
-        // Safety: the raw device only creates the pool and the buffers here; the pool is
-        // destroyed in `Drop`, while `device` is still alive.
+        // Safety: the raw device only creates the pool, the buffers and the fences here;
+        // they're destroyed in `Drop`, while `device` is still alive.
         unsafe {
             let hal_device = vulkan_device(device)?;
             let raw_device = hal_device.raw_device();
@@ -101,7 +108,15 @@ impl ScanoutBarriers {
                             .command_buffer_count(2),
                     )
                     .map_err(error)?;
-                barriers.slots.push(Slot { acquire: commands[0], release: commands[1] });
+                let fence = raw_device
+                    .create_fence(&vk::FenceCreateInfo::default(), None)
+                    .map_err(error)?;
+                barriers.slots.push(Slot {
+                    acquire: commands[0],
+                    release: commands[1],
+                    fence,
+                    fence_pending: Cell::new(false),
+                });
             }
             Ok(barriers)
         }
@@ -111,6 +126,17 @@ impl ScanoutBarriers {
     /// discarding what it shows.
     pub fn acquire(&self, index: usize, texture: &wgpu::Texture) -> Result<(), PlatformError> {
         let slot = &self.slots[index];
+        if slot.fence_pending.get() {
+            // Safety: the fence belongs to this device, and a submitted release signals it.
+            unsafe {
+                let hal_device = vulkan_device(&self.device)?;
+                let raw_device = hal_device.raw_device();
+                let error = |e: vk::Result| format!("Error waiting for a scanout barrier: {e}");
+                raw_device.wait_for_fences(&[slot.fence], true, u64::MAX).map_err(error)?;
+                raw_device.reset_fences(&[slot.fence]).map_err(error)?;
+            }
+            slot.fence_pending.set(false);
+        }
         let barrier = vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
             .dst_access_mask(
@@ -123,6 +149,7 @@ impl ScanoutBarriers {
             .subresource_range(COLOR_SUBRESOURCE);
         self.submit_barrier(
             slot.acquire,
+            None,
             texture,
             barrier,
             vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -134,8 +161,7 @@ impl ScanoutBarriers {
     /// controller.
     ///
     /// Submits after the renderer's work on wgpu's queue, so it is ordered behind it.
-    /// Wait for the queue to go idle before scanning the buffer out, and before the next
-    /// [`Self::acquire`] of any buffer, which re-records the command buffers.
+    /// Wait for the queue before scanning the buffer out.
     pub fn release(&self, index: usize, texture: &wgpu::Texture) -> Result<(), PlatformError> {
         if self.drawn_by_wgpu {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -163,23 +189,27 @@ impl ScanoutBarriers {
             .subresource_range(COLOR_SUBRESOURCE);
         self.submit_barrier(
             slot.release,
+            Some(slot.fence),
             texture,
             barrier,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-        )
+        )?;
+        slot.fence_pending.set(true);
+        Ok(())
     }
 
     fn submit_barrier(
         &self,
         commands: vk::CommandBuffer,
+        fence: Option<vk::Fence>,
         texture: &wgpu::Texture,
         barrier: vk::ImageMemoryBarrier<'_>,
         src_stage: vk::PipelineStageFlags,
         dst_stage: vk::PipelineStageFlags,
     ) -> Result<(), PlatformError> {
-        // Safety: `commands` belongs to this pool and isn't pending: the caller waited for
-        // the queue after the last release, see `release`. The image handle is read from a live texture and used only within
+        // Safety: `commands` belongs to this pool and isn't pending: its slot's fence
+        // signaled, and the fence of a submission covers every earlier one on the queue. The image handle is read from a live texture and used only within
         // this submission; the queue is wgpu's, submitted to from the one rendering
         // thread, in order with the renderer's own submissions.
         unsafe {
@@ -214,7 +244,7 @@ impl ScanoutBarriers {
                 .queue_submit(
                     hal_device.raw_queue(),
                     &[vk::SubmitInfo::default().command_buffers(&[commands])],
-                    vk::Fence::null(),
+                    fence.unwrap_or_default(),
                 )
                 .map_err(error)?;
         }
@@ -224,12 +254,15 @@ impl ScanoutBarriers {
 
 impl Drop for ScanoutBarriers {
     fn drop(&mut self) {
-        // Safety: the pool was created from this device in `new`. The wait makes sure none
-        // of its command buffers is still in use.
+        // Safety: the pool and the fences were created from this device in `new`. The
+        // wait makes sure none of them is still in use.
         unsafe {
             if let Ok(hal_device) = vulkan_device(&self.device) {
                 let raw_device = hal_device.raw_device();
                 raw_device.queue_wait_idle(hal_device.raw_queue()).ok();
+                for slot in &self.slots {
+                    raw_device.destroy_fence(slot.fence, None);
+                }
                 raw_device.destroy_command_pool(self.command_pool, None);
             }
         }
@@ -311,10 +344,10 @@ mod tests {
     }
 
     /// The way Skia uses the barriers: wgpu only records each image as a color target
-    /// before the frame, as `render_to_texture` does, and every frame waits for the GPU
-    /// after its release.
+    /// before the frame, as `render_to_texture` does, and the next frame starts before
+    /// the GPU finished the last one.
     #[test]
-    fn frames_drawn_past_wgpu_hand_over_cleanly() {
+    fn frames_drawn_past_wgpu_reuse_command_buffers_only_once_finished() {
         let Some((device, queue)) = validation::device() else { return };
 
         let barriers = ScanoutBarriers::new(&device, &queue, 2, false).expect("barriers");
@@ -334,8 +367,9 @@ mod tests {
             );
             queue.submit(Some(encoder.finish()));
             barriers.release(index, texture).expect("release");
-            wait_for_gpu(&device).expect("wait");
             assert_no_validation_errors(round);
         }
+        wait_for_gpu(&device).expect("wait");
+        assert_no_validation_errors(6);
     }
 }

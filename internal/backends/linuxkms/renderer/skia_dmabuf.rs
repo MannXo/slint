@@ -24,6 +24,7 @@ pub struct SkiaDmabufRendererAdapter {
     display: GbmDmabufDisplay,
     barriers: ScanoutBarriers,
     device: wgpu::Device,
+    queue: wgpu::Queue,
     size: PhysicalWindowSize,
 }
 
@@ -41,11 +42,11 @@ impl SkiaDmabufRendererAdapter {
         let display = GbmDmabufDisplay::new(drm_output, &device)?;
         let barriers = ScanoutBarriers::new(&device, &queue, BUFFER_COUNT, false)?;
 
-        let renderer = SkiaWGPU30Renderer::new(instance, adapter, device.clone(), queue)?;
+        let renderer = SkiaWGPU30Renderer::new(instance, adapter, device.clone(), queue.clone())?;
 
         eprintln!("Using Skia renderer with wgpu, presenting dma-bufs on a DRM plane");
 
-        Ok(Box::new(Self { renderer, display, barriers, device, size }))
+        Ok(Box::new(Self { renderer, display, barriers, device, queue, size }))
     }
 }
 
@@ -73,18 +74,26 @@ impl crate::fullscreenwindowadapter::FullscreenRenderer for SkiaDmabufRendererAd
             )
             .and_then(|()| self.barriers.release(index, texture));
 
-        // KMS has no way to wait on the render: wgpu-hal exports no sync fd for
-        // the plane's IN_FENCE_FD property, and wgpu won't take a signal semaphore
-        // for a submission. Block until the GPU is done instead, at the cost of a
-        // pipeline stall per frame. A failed frame waits too: the next one
-        // re-records the barriers it submitted.
-        let waited = wait_for_gpu(&self.device);
-        drawn?;
-        waited?;
+        if let Err(err) = drawn {
+            // A failed frame can leave barriers in flight that the next one re-records,
+            // without a submitted release whose fence would cover them.
+            wait_for_gpu(&self.device)?;
+            return Err(err);
+        }
 
-        self.display.present().map_err(|e| format!("Error presenting dma-buf: {e}"))?;
-
+        // Skia and the release submit to the queue directly, so this empty submission
+        // is the first one known to wgpu that completes after the frame.
+        let submission = self.queue.submit([]);
+        self.display
+            .present_after(&self.device, submission)
+            .map_err(|e| format!("Error presenting dma-buf: {e}"))?;
         Ok(DrawOutcome::Success)
+    }
+
+    fn flush_pending_frame(&self) -> Result<(), PlatformError> {
+        self.display
+            .flush(&self.device)
+            .map_err(|e| format!("Error presenting dma-buf: {e}").into())
     }
 
     fn size(&self) -> PhysicalWindowSize {
