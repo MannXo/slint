@@ -422,8 +422,6 @@ fn import_dmabuf_texture(
     bo: &gbm::BufferObject<()>,
     modifier: gbm::Modifier,
 ) -> Result<wgpu::Texture, PlatformError> {
-    let fd = bo.fd().map_err(|e| format!("Error exporting gbm buffer object as dma-buf: {e}"))?;
-
     let size = wgpu::Extent3d { width: bo.width(), height: bo.height(), depth_or_array_layers: 1 };
 
     let hal_descriptor = wgpu::hal::TextureDescriptor {
@@ -442,18 +440,33 @@ fn import_dmabuf_texture(
         view_formats: vec![],
     };
 
-    // Safety: the descriptor describes the buffer object `fd` was exported from,
-    // and `texture_from_dmabuf_fd` takes ownership of the fd.
+    // Safety: the descriptor describes `bo`, and `texture_from_dmabuf_fd` takes
+    // ownership of the fd exported from it.
     let hal_texture = unsafe {
-        crate::renderer::dmabuf::vulkan_device(device)?.texture_from_dmabuf_fd(
-            fd,
-            &hal_descriptor,
-            modifier.into(),
-            bo.stride() as u64,
-            bo.offset(0) as u64,
-        )
-    }
-    .map_err(|e| format!("Error importing dma-buf as a Vulkan image: {e}"))?;
+        let hal_device = crate::renderer::dmabuf::vulkan_device(device)?;
+        let linear = if modifier == gbm::Modifier::Linear {
+            import_linear_image(&hal_device, bo, &hal_descriptor)?
+        } else {
+            None
+        };
+        match linear {
+            Some(texture) => texture,
+            None => {
+                let fd = bo
+                    .fd()
+                    .map_err(|e| format!("Error exporting gbm buffer object as dma-buf: {e}"))?;
+                hal_device
+                    .texture_from_dmabuf_fd(
+                        fd,
+                        &hal_descriptor,
+                        modifier.into(),
+                        bo.stride() as u64,
+                        bo.offset(0) as u64,
+                    )
+                    .map_err(|e| format!("Error importing dma-buf as a Vulkan image: {e}"))?
+            }
+        }
+    };
 
     let descriptor = wgpu::TextureDescriptor {
         label: hal_descriptor.label,
@@ -470,11 +483,128 @@ fn import_dmabuf_texture(
 
     // Safety: `hal_texture` was just created from this device and matches the
     // descriptor. Its contents are undefined until the first frame is drawn.
-    Ok(unsafe {
+    let texture = unsafe {
         device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
             hal_texture,
             &descriptor,
             wgpu::TextureUses::UNINITIALIZED,
         )
-    })
+    };
+    Ok(texture)
+}
+
+/// Imports a linear `bo` as a `VK_IMAGE_TILING_LINEAR` image. Returns `None` where the
+/// driver can't render to such an image, or lays it out differently from gbm.
+///
+/// `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` with `DRM_FORMAT_MOD_LINEAR` describes the
+/// same memory, but NXP's Vivante driver ignores that modifier and renders tiled.
+///
+/// # Safety
+/// `hal_descriptor` must describe `bo`.
+unsafe fn import_linear_image(
+    hal_device: &wgpu::hal::vulkan::Device,
+    bo: &gbm::BufferObject<()>,
+    hal_descriptor: &wgpu::hal::TextureDescriptor,
+) -> Result<Option<wgpu::hal::vulkan::Texture>, PlatformError> {
+    use ash::vk;
+    use std::os::fd::{AsRawFd, IntoRawFd};
+
+    let instance = hal_device.shared_instance().raw_instance();
+    let device = hal_device.raw_device();
+
+    let features = unsafe {
+        instance.get_physical_device_format_properties(hal_device.raw_physical_device(), VK_FORMAT)
+    };
+    let needed = needed_tiling_features(features.optimal_tiling_features);
+    if !features.linear_tiling_features.contains(needed) || bo.offset(0) != 0 {
+        return Ok(None);
+    }
+
+    let mut external_memory = vk::ExternalMemoryImageCreateInfo::default()
+        .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(VK_FORMAT)
+        .extent(vk::Extent3D { width: bo.width(), height: bo.height(), depth: 1 })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::LINEAR)
+        .usage(VK_USAGE)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .push_next(&mut external_memory);
+    let image = unsafe { device.create_image(&image_info, None) }
+        .map_err(|e| format!("Error creating a linear Vulkan image for the scanout buffer: {e}"))?;
+    let destroy_image = || unsafe { device.destroy_image(image, None) };
+
+    let layout = unsafe {
+        device.get_image_subresource_layout(
+            image,
+            vk::ImageSubresource::default().aspect_mask(vk::ImageAspectFlags::COLOR),
+        )
+    };
+    if layout.offset != 0 || layout.row_pitch != u64::from(bo.stride()) {
+        destroy_image();
+        return Ok(None);
+    }
+
+    let fd = bo.fd().map_err(|e| {
+        destroy_image();
+        format!("Error exporting gbm buffer object as dma-buf: {e}")
+    })?;
+    let requirements = unsafe { device.get_image_memory_requirements(image) };
+    let external_memory_fd = ash::khr::external_memory_fd::Device::new(instance, device);
+    let mut fd_properties = vk::MemoryFdPropertiesKHR::default();
+    if let Err(e) = unsafe {
+        external_memory_fd.get_memory_fd_properties(
+            vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+            fd.as_raw_fd(),
+            &mut fd_properties,
+        )
+    } {
+        destroy_image();
+        return Err(format!("Error querying the scanout buffer's memory types: {e}").into());
+    }
+    let memory_types = requirements.memory_type_bits & fd_properties.memory_type_bits;
+    if memory_types == 0 {
+        destroy_image();
+        return Ok(None);
+    }
+
+    let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+        .fd(fd.as_raw_fd());
+    let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
+    let allocate_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(memory_types.trailing_zeros())
+        .push_next(&mut import_info)
+        .push_next(&mut dedicated_info);
+    let memory = match unsafe { device.allocate_memory(&allocate_info, None) } {
+        Ok(memory) => memory,
+        Err(e) => {
+            destroy_image();
+            return Err(format!("Error importing the scanout buffer's memory: {e}").into());
+        }
+    };
+    // A successful import takes ownership of the fd.
+    let _ = fd.into_raw_fd();
+
+    if let Err(e) = unsafe { device.bind_image_memory(image, memory, 0) } {
+        unsafe { device.free_memory(memory, None) };
+        destroy_image();
+        return Err(format!("Error binding the scanout buffer's memory: {e}").into());
+    }
+
+    // Safety: `image` was created from this device with `hal_descriptor`'s size,
+    // format and usage, and wgpu-hal destroys it and frees `memory` with the texture.
+    Ok(Some(unsafe {
+        hal_device.texture_from_raw(
+            image,
+            hal_descriptor,
+            None,
+            wgpu::hal::vulkan::TextureMemory::Dedicated(memory),
+        )
+    }))
 }
